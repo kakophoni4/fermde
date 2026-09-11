@@ -20,14 +20,12 @@ class AccessTests(unittest.TestCase):
         self.u=db.execute('INSERT INTO users(username,password) VALUES (?,?)',('user',db.password_hash('test-password-456')))
         self.d=db.execute('INSERT INTO devices(name,owner,profile,status,session,created) VALUES (?,?,?,?,?,?)',
             ('private',self.a,'pixel_7','stopped','test-session',time.time()))
-        self.client=TestClient(app)
+        self.client=TestClient(app,base_url='https://testserver')
 
     def tearDown(self): self.client.close(); db.DATA=self.old;self.temp.cleanup()
     def login(self,name='user',password='test-password-456'):
         r=self.client.post('/api/login',headers={'origin':ORIGIN},json={'username':name,'password':password})
         self.assertEqual(r.status_code,200)
-        # TestClient default HTTP does not send Secure cookies. Use HTTPS requests.
-        self.client.base_url='https://testserver'
 
     def test_password_hash(self):
         h=db.password_hash('hello-very-long-password')

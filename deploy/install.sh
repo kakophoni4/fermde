@@ -98,7 +98,9 @@ if [[ "$PUBLIC_HOST" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then TLS_LINE='tls 
 cat > /etc/caddy/fermde.caddy <<CADDY
 https://$PUBLIC_HOST {
     $TLS_LINE
-    request_body { max_size 520MB }
+    request_body {
+        max_size 520MB
+    }
     reverse_proxy 127.0.0.1:8090 {
         flush_interval -1
     }

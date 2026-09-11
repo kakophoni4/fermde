@@ -40,6 +40,7 @@ def control_packet(message,width,height):
 async def serve(ws,i,u):
     from fermde.app import adb, ADB, current, device_for
     if i in viewers:
+        await ws.accept()
         await ws.close(code=4429,reason='Устройство уже открыто в другой вкладке'); return
     viewers.add(i)
     await ws.accept()
