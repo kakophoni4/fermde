@@ -18,6 +18,15 @@ rsync -a --chown=root:root --exclude=__pycache__ fermde/ /opt/fermde/fermde/
 rsync -a --chown=root:root static/ /opt/fermde/static/
 rsync -a --chown=root:root --exclude=__pycache__ tests/ /opt/fermde/tests/
 rsync -a --chown=root:root deploy/ /opt/fermde/deploy/
+# Apply the confirmed child-ADB shutdown fix to existing units without restarting
+# their emulators. SIGTERM goes to QEMU; remaining helpers die after QEMU exits.
+for PHONE_UNIT in /etc/systemd/system/fermde-phone-*.service; do
+  [[ -f "$PHONE_UNIT" ]] || continue
+  [[ "$(basename "$PHONE_UNIT")" =~ ^fermde-phone-[0-9]+\.service$ ]] || continue
+  install -d -m 0755 "$PHONE_UNIT.d"
+  printf '[Service]\nKillMode=mixed\n' > "$PHONE_UNIT.d/20-shutdown.conf"
+done
+systemctl daemon-reload
 systemctl start fermde
 trap - EXIT
 for attempt in {1..20}; do

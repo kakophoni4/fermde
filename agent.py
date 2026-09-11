@@ -277,6 +277,7 @@ BindReadOnlyPaths=/etc/netns/{ns}/resolv.conf:/etc/resolv.conf
 ExecStart={SDK}/emulator/emulator -avd phone -port 5554 -accel on -gpu host -no-window -no-snapshot -no-metrics -cores 4 -memory 4096 -camera-back none -camera-front none -dns-server 127.0.0.1 -timezone Europe/Samara
 TimeoutStopSec=60
 KillSignal=SIGTERM
+KillMode=mixed
 MemoryMax=8G
 TasksMax=1024
 ''',0o644)
@@ -307,6 +308,9 @@ def delete(i):
     run('userdel',user,check=False)
     for kind in ('phone','proxy','dns','adb'):
         Path('/etc/systemd/system',unit(i,kind)).unlink(missing_ok=True)
+    shutdown_dir=Path('/etc/systemd/system',unit(i,'phone')+'.d')
+    (shutdown_dir/'20-shutdown.conf').unlink(missing_ok=True)
+    with __import__('contextlib').suppress(OSError): shutdown_dir.rmdir()
     run('systemctl','daemon-reload')
     return {'deleted':True}
 

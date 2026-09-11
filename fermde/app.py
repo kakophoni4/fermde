@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -21,6 +22,7 @@ ADB = '/opt/fermde-sdk/platform-tools/adb'
 os.environ['ADB_SERVER_SOCKET']='tcp:127.0.0.1:5039'
 operation_lock = asyncio.Lock()
 jobs = set()
+log = logging.getLogger('uvicorn.error')
 
 def fail(message, code=400): raise HTTPException(code,message)
 
@@ -47,7 +49,12 @@ async def adb(serial,*args, timeout=30):
 
 async def connect_device(serial):
     p=await asyncio.create_subprocess_exec(ADB,'connect',serial,stdout=asyncio.subprocess.DEVNULL,stderr=asyncio.subprocess.DEVNULL)
-    await asyncio.wait_for(p.wait(),10)
+    try:
+        await asyncio.wait_for(p.wait(),3)
+    except (asyncio.TimeoutError,asyncio.CancelledError):
+        with contextlib.suppress(ProcessLookupError): p.kill()
+        await p.wait()
+        raise
 
 def current(token):
     if not token: return None
@@ -95,7 +102,11 @@ async def refresh_proxy(i, session):
 
 
 async def perform(i, actor, action):
-    async with operation_lock:
+    queued=time.monotonic()
+    # A stop reduces resource usage and must not wait for another phone to boot.
+    # The root agent still serializes host mutations; DB status gates duplicates.
+    async with (asyncio.Lock() if action=='stop' else operation_lock):
+        log.info('lifecycle phone=%s action=%s phase=begin queue_seconds=%.3f',i,action,time.monotonic()-queued)
         d=db.one('SELECT * FROM devices WHERE id=?',(i,))
         if not d: return
         try:
@@ -120,15 +131,20 @@ async def perform(i, actor, action):
                 if g['free']<needed: raise RuntimeError('Недостаточно свободной VRAM. Работающие телефоны сохранены.')
                 result=await agent('start',id=i,connection=json.loads(db.decrypt(d['proxy'])))
                 serial=result['serial']
+                boot_started=time.monotonic()
+                log.info('lifecycle phone=%s phase=waiting_adb serial=%s',i,serial)
                 db.execute("UPDATE devices SET status='booting',wanted=1,error='' WHERE id=?",(i,))
                 for _ in range(180):
                     try:
-                        await connect_device(serial)
                         if await adb(serial,'shell','getprop','sys.boot_completed',timeout=5)=='1': break
-                    except Exception: pass
+                    except Exception as e:
+                        if _ % 5 == 0:
+                            log.info('lifecycle phone=%s phase=adb_not_ready elapsed=%.3f error_type=%s',i,time.monotonic()-boot_started,type(e).__name__)
+                        with contextlib.suppress(Exception): await connect_device(serial)
                     await asyncio.sleep(1)
                 else: raise RuntimeError('Android ещё не загрузился. Процесс оставлен работающим; проверьте журнал.')
                 db.execute("UPDATE devices SET status='running',error='' WHERE id=?",(i,))
+                log.info('lifecycle phone=%s phase=ready boot_wait_seconds=%.3f total_seconds=%.3f',i,time.monotonic()-boot_started,time.monotonic()-queued)
                 launch(refresh_proxy(i,d['session']))
                 with contextlib.suppress(Exception):
                     await adb(serial,'shell','settings','put','global','device_name',f'Phone-{i}',timeout=3)
@@ -139,11 +155,13 @@ async def perform(i, actor, action):
                 await agent('delete',id=i)
                 db.execute('DELETE FROM devices WHERE id=?',(i,))
             db.audit(actor,action,i,'completed')
+            log.info('lifecycle phone=%s action=%s phase=complete total_seconds=%.3f',i,action,time.monotonic()-queued)
         except Exception as e:
             # Credentials never appear in generic httpx messages displayed here.
             message=str(e)[:1000] if not isinstance(e,httpx.HTTPError) else 'Ошибка соединения с FloppyData'
             db.execute("UPDATE devices SET status='error',error=? WHERE id=?",(message,i))
             db.audit(actor,action,i,'failed')
+            log.info('lifecycle phone=%s action=%s phase=failed error_type=%s',i,action,type(e).__name__)
 
 async def reconcile():
     while True:
@@ -152,14 +170,15 @@ async def reconcile():
         try:
             inv={x['id']:x for x in await agent('inventory')}
             for d in db.rows('SELECT * FROM devices'):
+                if d['status'] in ('stopping','deleting'): continue
                 item=inv.get(d['id'])
                 if item and item['active']:
                     try:
-                        await connect_device(item['serial'])
                         boot=await adb(item['serial'],'shell','getprop','sys.boot_completed',timeout=5)
                         if boot=='1' and d['status']!='running':
                             db.execute("UPDATE devices SET status='running',wanted=1 WHERE id=?",(d['id'],))
-                    except Exception: pass
+                    except Exception:
+                        with contextlib.suppress(Exception): await connect_device(item['serial'])
                 elif d['status'] in ('running','booting','starting','stopping','creating','deleting'):
                     db.execute("UPDATE devices SET status='error',error=? WHERE id=?",
                         ('Процесс не работает. Данные сохранены; проверьте журнал.',d['id']))

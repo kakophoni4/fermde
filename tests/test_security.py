@@ -111,4 +111,14 @@ class AccessTests(unittest.TestCase):
         self.assertEqual(db.one('SELECT status FROM devices WHERE id=?',(self.d,))['status'],'running')
         background.assert_called_once()
 
+    def test_stop_does_not_wait_for_another_phone_boot_lock(self):
+        from fermde.app import perform, operation_lock
+        db.execute("UPDATE devices SET status='stopping' WHERE id=?",(self.d,))
+        async def scenario():
+            async with operation_lock:
+                await asyncio.wait_for(perform(self.d,self.a,'stop'),1)
+        with patch('fermde.app.agent',AsyncMock(return_value={})):
+            asyncio.run(scenario())
+        self.assertEqual(db.one('SELECT status FROM devices WHERE id=?',(self.d,))['status'],'stopped')
+
 if __name__=='__main__': unittest.main()
