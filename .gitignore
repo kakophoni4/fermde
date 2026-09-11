@@ -1,0 +1,11 @@
+Start-Android.*
+.env
+.venv/
+__pycache__/
+*.pyc
+*.db*
+*.key
+*.pem
+data/
+vendor/
+.sites-runtime/
