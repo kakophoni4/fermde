@@ -84,7 +84,7 @@ User=fermde
 Group=fermde
 Environment=HOME=/var/lib/fermde
 UnsetEnvironment=ADB_SERVER_SOCKET
-ExecStart=/opt/fermde-sdk/platform-tools/adb -L tcp:127.0.0.1:5039 nodaemon server
+ExecStart=/opt/fermde-sdk/platform-tools/adb -L tcp:5039 nodaemon server
 Restart=on-failure
 RestartSec=2
 UMask=0077
@@ -92,7 +92,9 @@ UMask=0077
 WantedBy=multi-user.target
 UNIT
 systemctl daemon-reload
-systemctl enable --now fermde-adb.service
+systemctl enable fermde-adb.service
+systemctl reset-failed fermde-adb.service || true
+systemctl restart fermde-adb.service
 adb_ready=false
 for attempt in {1..30}; do
   if runuser -u fermde -- env HOME=/var/lib/fermde ADB_SERVER_SOCKET=tcp:127.0.0.1:5039 /opt/fermde-sdk/platform-tools/adb devices >/dev/null 2>&1; then
