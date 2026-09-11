@@ -21,8 +21,12 @@ STATIC = Path(__file__).resolve().parent.parent/'static'
 ADB = '/opt/fermde-sdk/platform-tools/adb'
 os.environ['ADB_SERVER_SOCKET']='tcp:127.0.0.1:5039'
 operation_lock = asyncio.Lock()
+device_locks = {}
 jobs = set()
 log = logging.getLogger('uvicorn.error')
+
+def device_lock(i):
+    return device_locks.setdefault(i,asyncio.Lock())
 
 def fail(message, code=400): raise HTTPException(code,message)
 
@@ -103,9 +107,8 @@ async def refresh_proxy(i, session):
 
 async def perform(i, actor, action):
     queued=time.monotonic()
-    # A stop reduces resource usage and must not wait for another phone to boot.
-    # The root agent still serializes host mutations; DB status gates duplicates.
-    async with (asyncio.Lock() if action=='stop' else operation_lock):
+    # Only operations for this device share a queue. Admission below is global.
+    async with device_lock(i):
         log.info('lifecycle phone=%s action=%s phase=begin queue_seconds=%.3f',i,action,time.monotonic()-queued)
         d=db.one('SELECT * FROM devices WHERE id=?',(i,))
         if not d: return
@@ -119,21 +122,27 @@ async def perform(i, actor, action):
                 await agent('create',id=i,profile=d['profile'])
                 db.execute("UPDATE devices SET status='stopped',error='' WHERE id=?",(i,))
             elif action=='start':
-                inventory=await agent('inventory')
-                running={x['id'] for x in inventory if x['active']}
-                owner=db.one('SELECT * FROM users WHERE id=?',(d['owner'],))
-                if not owner or not owner['active']: raise RuntimeError('Владелец отключён')
-                owned=sum(x['id'] in running for x in db.rows('SELECT id FROM devices WHERE owner=?',(d['owner'],)))
-                if len(running)>=int(db.setting('max_running')) or owned>=owner['running_quota']:
-                    raise RuntimeError('Достигнут лимит одновременно работающих устройств')
-                g=await agent('stats')
-                needed=sum(int(db.setting(x)) for x in ('reserve_mib','headroom_mib','device_budget_mib'))
-                if g['free']<needed: raise RuntimeError('Недостаточно свободной VRAM. Работающие телефоны сохранены.')
-                result=await agent('start',id=i,connection=json.loads(db.decrypt(d['proxy'])))
+                admission_started=time.monotonic()
+                async with operation_lock:
+                    inventory=await agent('inventory')
+                    running={x['id'] for x in inventory if x['active']}
+                    owner=db.one('SELECT * FROM users WHERE id=?',(d['owner'],))
+                    if not owner or not owner['active']: raise RuntimeError('Владелец отключён')
+                    owned=sum(x['id'] in running for x in db.rows('SELECT id FROM devices WHERE owner=?',(d['owner'],)))
+                    if len(running)>=int(db.setting('max_running')) or owned>=owner['running_quota']:
+                        raise RuntimeError('Достигнут лимит одновременно работающих устройств')
+                    g=await agent('stats')
+                    # Already admitted phones may not have allocated their VRAM yet.
+                    warming=sum(x['id'] in running for x in db.rows("SELECT id FROM devices WHERE status='booting'"))
+                    needed=sum(int(db.setting(x)) for x in ('reserve_mib','headroom_mib','device_budget_mib'))
+                    needed+=warming*int(db.setting('device_budget_mib'))
+                    if g['free']<needed: raise RuntimeError('Недостаточно свободной VRAM с учётом загружающихся телефонов.')
+                    result=await agent('start',id=i,connection=json.loads(db.decrypt(d['proxy'])))
+                    db.execute("UPDATE devices SET status='booting',wanted=1,error='' WHERE id=?",(i,))
+                log.info('lifecycle phone=%s phase=admitted admission_seconds=%.3f',i,time.monotonic()-admission_started)
                 serial=result['serial']
                 boot_started=time.monotonic()
                 log.info('lifecycle phone=%s phase=waiting_adb serial=%s',i,serial)
-                db.execute("UPDATE devices SET status='booting',wanted=1,error='' WHERE id=?",(i,))
                 for _ in range(180):
                     try:
                         if await adb(serial,'shell','getprop','sys.boot_completed',timeout=5)=='1': break
@@ -163,26 +172,49 @@ async def perform(i, actor, action):
             db.audit(actor,action,i,'failed')
             log.info('lifecycle phone=%s action=%s phase=failed error_type=%s',i,action,type(e).__name__)
 
+async def reconcile_device(i,item):
+    lock=device_lock(i)
+    if lock.locked() or (item and item.get('busy')): return
+    async with lock:
+        d=db.one('SELECT * FROM devices WHERE id=?',(i,))
+        if not d: return
+        if d['status']=='stopping':
+            if item: await agent('stop',id=i)
+            db.execute("UPDATE devices SET status='stopped',wanted=0,error='' WHERE id=?",(i,))
+            log.info('lifecycle phone=%s phase=recovered_stop',i)
+        elif d['status']=='deleting':
+            await agent('delete',id=i)
+            db.execute('DELETE FROM devices WHERE id=?',(i,))
+            log.info('lifecycle phone=%s phase=recovered_delete',i)
+        elif item and item['active']:
+            try:
+                boot=await adb(item['serial'],'shell','getprop','sys.boot_completed',timeout=5)
+                if boot=='1' and d['status']!='running':
+                    db.execute("UPDATE devices SET status='running',wanted=1 WHERE id=?",(i,))
+                    log.info('lifecycle phone=%s phase=recovered_ready',i)
+            except Exception:
+                with contextlib.suppress(Exception): await connect_device(item['serial'])
+        elif d['status']=='creating' and item:
+            db.execute("UPDATE devices SET status='stopped',wanted=0,error='' WHERE id=?",(i,))
+        elif d['status'] in ('running','booting','starting','creating'):
+            db.execute("UPDATE devices SET status='error',error=? WHERE id=?",
+                       ('Процесс не работает. Данные сохранены; проверьте журнал.',i))
+
+
 async def reconcile():
     while True:
-        await asyncio.sleep(15)
-        if operation_lock.locked(): continue
         try:
             inv={x['id']:x for x in await agent('inventory')}
-            for d in db.rows('SELECT * FROM devices'):
-                if d['status'] in ('stopping','deleting'): continue
-                item=inv.get(d['id'])
-                if item and item['active']:
-                    try:
-                        boot=await adb(item['serial'],'shell','getprop','sys.boot_completed',timeout=5)
-                        if boot=='1' and d['status']!='running':
-                            db.execute("UPDATE devices SET status='running',wanted=1 WHERE id=?",(d['id'],))
-                    except Exception:
-                        with contextlib.suppress(Exception): await connect_device(item['serial'])
-                elif d['status'] in ('running','booting','starting','stopping','creating','deleting'):
-                    db.execute("UPDATE devices SET status='error',error=? WHERE id=?",
-                        ('Процесс не работает. Данные сохранены; проверьте журнал.',d['id']))
-        except Exception: pass
+            slots=asyncio.Semaphore(8)
+            async def check(i):
+                async with slots:
+                    try: await reconcile_device(i,inv.get(i))
+                    except Exception as e:
+                        log.info('lifecycle phone=%s phase=reconcile_error error_type=%s',i,type(e).__name__)
+            await asyncio.gather(*(check(d['id']) for d in db.rows('SELECT id FROM devices')))
+        except Exception as e:
+            log.info('lifecycle phase=inventory_error error_type=%s',type(e).__name__)
+        await asyncio.sleep(5)
 
 @asynccontextmanager
 async def lifespan(app):
@@ -289,7 +321,9 @@ async def device_action(i:int,action:str,request:Request):
     if action=='change-proxy':
         if not u['admin']: fail('Доступ только администратору',403)
         if d['status']!='stopped': fail('Сначала остановите устройство')
-        async with operation_lock:
+        async with device_lock(i):
+            d=device_for(u,i)
+            if d['status']!='stopped': fail('Сначала остановите устройство')
             session='phone_'+secrets.token_hex(12)
             result=await floppy('proxy/rotating/connections',dict(type='residential',country=db.setting('country'),
                 protocol='socks5',rotation=0,session=session,udp=True))
@@ -307,6 +341,7 @@ async def device_action(i:int,action:str,request:Request):
             fail(str(e),502)
         db.execute("UPDATE devices SET ip=?,error='' WHERE id=?",(result['ip'],i)); return result
     if d['status'] in ('creating','starting','booting','stopping','deleting'): fail('Дождитесь завершения текущей операции')
+    if device_lock(i).locked(): fail('Операция с этим телефоном ещё выполняется')
     if action=='restart':
         if d['status']!='running': fail('Телефон не запущен')
         await adb(f'10.231.{i}.2:15555','reboot')

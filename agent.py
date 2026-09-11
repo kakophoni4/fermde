@@ -15,6 +15,7 @@ import socket
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import quote
 from fermde.profiles import PROFILES, IMAGE
@@ -61,7 +62,11 @@ def manifest(i):
 
 def public(i):
     m = manifest(i)
-    return {'id':i,'active':active(i),'serial':m['ip']+':15555','profile':m['profile']}
+    busy=False
+    with open(f'/run/lock/fermde-device-{i}.lock','a') as lock:
+        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: busy=True
+    return {'id':i,'active':active(i),'serial':m['ip']+':15555','profile':m['profile'],'busy':busy}
 
 def ipt(*args):
     run('iptables','-w','5',*args)
@@ -162,8 +167,7 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 def cleanup_network(i):
     user, base, ns = names(i)
-    for kind in ('adb','dns','proxy'):
-        run('systemctl','stop',unit(i,kind),check=False)
+    run('systemctl','stop',*(unit(i,kind) for kind in ('adb','dns','proxy')),check=False)
     m = json.loads((base/'manifest.json').read_text()) if (base/'manifest.json').exists() else {}
     guest = f'10.231.{i}.2'
     rules = [('nat','POSTROUTING',['-s',guest+'/32','-j','MASQUERADE']),
@@ -341,6 +345,11 @@ def check_proxy(i):
     raise RuntimeError('HTTPS через прокси не отвечает. Проверьте доступность прокси-сессии.')
 
 
+def inventory_item(i):
+    try: return public(i)
+    except FileNotFoundError: return None
+
+
 def main():
     if os.geteuid()!=0: raise PermissionError('Root agent required')
     ROOT.mkdir(mode=0o711,parents=True,exist_ok=True)
@@ -348,15 +357,20 @@ def main():
     action = req.get('action')
     if action == 'stats': return gpu()
     if action == 'inventory':
-        return [public(int(p.name)) for p in ROOT.iterdir() if p.name.isdigit() and (p/'manifest.json').exists()]
+        ids=[int(p.name) for p in ROOT.iterdir() if p.name.isdigit() and (p/'manifest.json').exists()]
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            return [item for item in pool.map(inventory_item,ids) if item]
     i = req.get('id')
     if type(i) is not int or not 1<=i<=200: raise ValueError('Device id must be 1..200')
     # External diagnostics must not block lifecycle mutations.
     if action=='check_proxy': return check_proxy(i)
-    with open('/run/lock/fermde-agent.lock','w') as lock:
+    with open(f'/run/lock/fermde-device-{i}.lock','a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         if action=='create': return create(i,req)
-        if action=='start': return start(i,req)
+        if action=='start':
+            with open('/run/lock/fermde-agent.lock','a') as admission:
+                fcntl.flock(admission,fcntl.LOCK_EX)
+                return start(i,req)
         if action=='stop': return stop(i)
         if action=='delete': return delete(i)
         if action=='logs':

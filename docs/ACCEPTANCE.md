@@ -102,6 +102,22 @@ nvidia-smi --query-gpu=timestamp,memory.total,memory.used,memory.free,utilizatio
 паролем, базу данных или архив резервной копии.
 # Viewer and DNS update
 
+## Concurrent lifecycle checks
+
+After updating, start two stopped phones without waiting for the first to boot.
+The `lifecycle` journal must show both `phase=waiting_adb` entries before the
+first `phase=ready`. Admission and host setup remain serialized; Android boot,
+stop, deletion, proxy requests and reconciliation are isolated by device.
+Pending boots reserve an additional device budget during admission, so a burst
+of starts can be refused until earlier boots complete even if the GPU is still
+mostly empty. This is intentional protection against delayed VRAM allocation.
+
+On panel restart, an interrupted `stopping` or `deleting` operation is completed
+only when neither a panel task nor a root device lock owns that device. Verify
+that an inactive phone with a leftover socat bridge becomes `stopped` and that
+the bridge exits. Active unrelated devices must keep running. Device backups
+now use the same per-device root lock as lifecycle mutations.
+
 Run `bash deploy/update.sh` from `/opt/fermde-src` on the server. The script runs
 the Python checks on the server and updates panel code without stopping phones.
 Then explicitly stop and start the test phone from the panel (Android's Reboot

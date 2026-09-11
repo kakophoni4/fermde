@@ -15,6 +15,9 @@ from fermde.stream import control_packet
 
 class AccessTests(unittest.TestCase):
     def setUp(self):
+        import fermde.app as lifecycle
+        lifecycle.operation_lock=asyncio.Lock()
+        lifecycle.device_locks.clear()
         self.temp=tempfile.TemporaryDirectory()
         self.old=db.DATA; db.DATA=Path(self.temp.name);db.init()
         self.a=db.execute('INSERT INTO users(username,password,admin) VALUES (?,?,1)',('admin',db.password_hash('test-password-123')))
@@ -120,5 +123,64 @@ class AccessTests(unittest.TestCase):
         with patch('fermde.app.agent',AsyncMock(return_value={})):
             asyncio.run(scenario())
         self.assertEqual(db.one('SELECT status FROM devices WHERE id=?',(self.d,))['status'],'stopped')
+
+    def test_two_phones_boot_concurrently(self):
+        import fermde.app as lifecycle
+        db.execute("UPDATE devices SET status='starting',proxy='test' WHERE id=?",(self.d,))
+        second=db.execute('INSERT INTO devices(name,owner,profile,status,session,proxy,created) VALUES (?,?,?,?,?,?,?)',
+                          ('second',self.a,'pixel_7','starting','second-session','test',time.time()))
+        db.execute('UPDATE users SET running_quota=2 WHERE id=?',(self.a,))
+        async def scenario():
+            started=set(); both=asyncio.Event()
+            async def host(action,**kwargs):
+                if action=='inventory': return [{'id':i,'active':True} for i in started]
+                if action=='stats': return {'free':100000}
+                if action=='start':
+                    started.add(kwargs['id'])
+                    if len(started)==2: both.set()
+                    return {'serial':str(kwargs['id'])}
+                raise AssertionError(action)
+            async def android(*args,**kwargs):
+                await both.wait()
+                return '1'
+            with patch('fermde.app.agent',side_effect=host), patch('fermde.app.adb',side_effect=android), \
+                 patch('fermde.app.db.decrypt',return_value='{}'), \
+                 patch('fermde.app.launch',side_effect=lambda coro:coro.close()):
+                await asyncio.wait_for(asyncio.gather(lifecycle.perform(self.d,self.a,'start'),
+                                                    lifecycle.perform(second,self.a,'start')),2)
+        asyncio.run(scenario())
+        self.assertEqual([r['status'] for r in db.rows('SELECT status FROM devices ORDER BY id')],['running','running'])
+
+    def test_booting_phone_reserves_memory_for_next_admission(self):
+        import fermde.app as lifecycle
+        db.execute("UPDATE devices SET status='booting' WHERE id=?",(self.d,))
+        second=db.execute('INSERT INTO devices(name,owner,profile,status,session,proxy,created) VALUES (?,?,?,?,?,?,?)',
+                          ('second',self.a,'pixel_7','starting','second-session','test',time.time()))
+        db.execute('UPDATE users SET running_quota=2 WHERE id=?',(self.a,))
+        db.set_setting('max_running',4)
+        db.set_setting('reserve_mib',8192)
+        db.set_setting('headroom_mib',1024)
+        db.set_setting('device_budget_mib',1536)
+        host=AsyncMock(side_effect=[[{'id':self.d,'active':True}],{'free':12000}])
+        with patch('fermde.app.agent',host):
+            asyncio.run(lifecycle.perform(second,self.a,'start'))
+        self.assertEqual(host.await_count,2)
+        self.assertIn('VRAM',db.one('SELECT error FROM devices WHERE id=?',(second,))['error'])
+
+    def test_recover_interrupted_stop_cleans_bridge_and_status(self):
+        from fermde.app import reconcile_device
+        db.execute("UPDATE devices SET status='stopping' WHERE id=?",(self.d,))
+        with patch('fermde.app.agent',AsyncMock(return_value={})) as host:
+            asyncio.run(reconcile_device(self.d,{'active':False,'busy':False}))
+        host.assert_awaited_once_with('stop',id=self.d)
+        self.assertEqual(db.one('SELECT status FROM devices WHERE id=?',(self.d,))['status'],'stopped')
+
+    def test_recovery_does_not_race_root_operation(self):
+        from fermde.app import reconcile_device
+        db.execute("UPDATE devices SET status='stopping' WHERE id=?",(self.d,))
+        with patch('fermde.app.agent',AsyncMock()) as host:
+            asyncio.run(reconcile_device(self.d,{'active':False,'busy':True}))
+        host.assert_not_awaited()
+        self.assertEqual(db.one('SELECT status FROM devices WHERE id=?',(self.d,))['status'],'stopping')
 
 if __name__=='__main__': unittest.main()
