@@ -241,6 +241,9 @@ def start(i,args):
         guest, endpoint = network(i,args['connection'])
         m.update(ip=guest,endpoint=endpoint)
         write(base/'manifest.json',json.dumps(m))
+        # Netsim discovers its daemon through TMPDIR/XDG_RUNTIME_DIR. Sharing
+        # /tmp/netsim.ini crosses network namespaces and collides between UIDs.
+        # Keep the host /tmp visible for the NVIDIA X11 socket (no PrivateTmp).
         write(f'/etc/systemd/system/{unit(i,"phone")}',f'''[Unit]
 Description=Fermde Android {i}
 Requires=android-display.service
@@ -248,8 +251,13 @@ After=android-display.service
 [Service]
 User={user}
 WorkingDirectory={base}/home
+RuntimeDirectory=fermde-phone-{i}
+RuntimeDirectoryMode=0700
 Environment=HOME={base}/home
 Environment=ANDROID_HOME={SDK}
+Environment=TMPDIR=/run/fermde-phone-{i}
+Environment=XDG_RUNTIME_DIR=/run/fermde-phone-{i}
+Environment=ANDROID_TMP=/run/fermde-phone-{i}
 Environment=DISPLAY=:99
 Environment=XAUTHORITY={auth}
 NetworkNamespacePath=/run/netns/{ns}
