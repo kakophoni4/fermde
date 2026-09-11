@@ -7,7 +7,7 @@ venv/bin/python -m compileall -q fermde agent.py
 echo '=== Unit tests (server only) ==='
 venv/bin/python -m unittest discover -s tests -v
 echo '=== Services ==='
-systemctl is-active fermde caddy android-display
+systemctl is-active fermde fermde-adb caddy android-display
 echo '=== HTTP health ==='
 curl -fsS http://127.0.0.1:8090/healthz
 echo

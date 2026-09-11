@@ -56,8 +56,8 @@ chmod 0640 /etc/fermde/panel.env
 cat > /etc/systemd/system/fermde.service <<'UNIT'
 [Unit]
 Description=Fermde Android panel
-After=network-online.target
-Wants=network-online.target
+After=network-online.target fermde-adb.service
+Wants=network-online.target fermde-adb.service
 [Service]
 User=fermde
 Group=fermde
@@ -75,7 +75,37 @@ TimeoutStopSec=250
 WantedBy=multi-user.target
 UNIT
 # Do not enable NoNewPrivileges: the narrow sudo agent intentionally creates namespaces.
-runuser -u fermde -- env HOME=/var/lib/fermde ADB_SERVER_SOCKET=tcp:127.0.0.1:5039 /opt/fermde-sdk/platform-tools/adb start-server
+cat > /etc/systemd/system/fermde-adb.service <<'UNIT'
+[Unit]
+Description=Fermde private ADB server
+After=network.target
+[Service]
+User=fermde
+Group=fermde
+Environment=HOME=/var/lib/fermde
+UnsetEnvironment=ADB_SERVER_SOCKET
+ExecStart=/opt/fermde-sdk/platform-tools/adb -L tcp:127.0.0.1:5039 nodaemon server
+Restart=on-failure
+RestartSec=2
+UMask=0077
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable --now fermde-adb.service
+adb_ready=false
+for attempt in {1..30}; do
+  if runuser -u fermde -- env HOME=/var/lib/fermde ADB_SERVER_SOCKET=tcp:127.0.0.1:5039 /opt/fermde-sdk/platform-tools/adb devices >/dev/null 2>&1; then
+    adb_ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$adb_ready" != true ]]; then
+  journalctl -u fermde-adb.service -n 30 --no-pager
+  echo 'Private ADB server did not become ready; installation stopped.'
+  exit 1
+fi
 runuser -u fermde -- env HOME=/var/lib/fermde PYTHONPATH=/opt/fermde /opt/fermde/venv/bin/python -m fermde.admin bootstrap
 if ! command -v caddy >/dev/null; then
   curl -fsSL https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor --yes -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg

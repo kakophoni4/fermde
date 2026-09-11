@@ -57,7 +57,8 @@ only bounded JSON operations. It controls `fermde-phone-N`, `fermde-proxy-N`, an
 
 Each phone has a network namespace `fermde-N`, address `10.231.N.2/30`, a UID `fdN`,
 and disk at `/var/lib/fermde-agent/N/home`. Shared SDK files are read-only to device users.
-The host-side `fermde` ADB server uses 5039, separate from the existing 5037 server.
+The host-side `fermde-adb.service` runs ADB in the foreground on 5039, separate from
+the existing 5037 server. It is supervised by systemd and starts after host reboot.
 ADB forwarding and all streaming ports bind to localhost. Caddy is the only public UI.
 Root-level access to the host remains trusted; this is not a hardened hostile-tenant
 hypervisor offering. Android apps cannot directly access the panel's credentials.
