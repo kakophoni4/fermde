@@ -117,7 +117,7 @@ def network(i, conn):
         oifname "tun0" accept
         ip daddr {host} tcp sport 15555 ct state established accept
         ip daddr {addr} tcp dport {port} accept
-        ip daddr {addr} udp accept
+        ip daddr {addr} meta l4proto udp accept
       }}
     }}'''
     nr('nft','-f','-',input=rules)
