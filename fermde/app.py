@@ -83,6 +83,17 @@ async def floppy(path,payload=None):
 def launch(coro):
     task=asyncio.create_task(coro); jobs.add(task); task.add_done_callback(jobs.discard)
 
+async def refresh_proxy(i, session):
+    # Diagnostics must not hold the lifecycle queue or gate screen access.
+    try:
+        result=await agent('check_proxy',id=i)
+        db.execute("UPDATE devices SET ip=?,error='' WHERE id=? AND status='running' AND session=?",
+                   (result['ip'],i,session))
+    except Exception as e:
+        db.execute("UPDATE devices SET ip='',error=? WHERE id=? AND status='running' AND session=?",
+                   (str(e)[:500],i,session))
+
+
 async def perform(i, actor, action):
     async with operation_lock:
         d=db.one('SELECT * FROM devices WHERE id=?',(i,))
@@ -110,20 +121,17 @@ async def perform(i, actor, action):
                 result=await agent('start',id=i,connection=json.loads(db.decrypt(d['proxy'])))
                 serial=result['serial']
                 db.execute("UPDATE devices SET status='booting',wanted=1,error='' WHERE id=?",(i,))
-                for _ in range(90):
+                for _ in range(180):
                     try:
                         await connect_device(serial)
                         if await adb(serial,'shell','getprop','sys.boot_completed',timeout=5)=='1': break
                     except Exception: pass
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)
                 else: raise RuntimeError('Android ещё не загрузился. Процесс оставлен работающим; проверьте журнал.')
-                await adb(serial,'shell','settings','put','global','device_name',f'Phone-{i}')
                 db.execute("UPDATE devices SET status='running',error='' WHERE id=?",(i,))
-                try:
-                    result=await agent('check_proxy',id=i)
-                    db.execute('UPDATE devices SET ip=? WHERE id=?',(result['ip'],i))
-                except Exception as e:
-                    db.execute('UPDATE devices SET ip=?,error=? WHERE id=?',('',str(e)[:500],i))
+                launch(refresh_proxy(i,d['session']))
+                with contextlib.suppress(Exception):
+                    await adb(serial,'shell','settings','put','global','device_name',f'Phone-{i}',timeout=3)
             elif action=='stop':
                 await agent('stop',id=i)
                 db.execute("UPDATE devices SET status='stopped',wanted=0,error='' WHERE id=?",(i,))

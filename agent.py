@@ -347,6 +347,8 @@ def main():
         return [public(int(p.name)) for p in ROOT.iterdir() if p.name.isdigit() and (p/'manifest.json').exists()]
     i = req.get('id')
     if type(i) is not int or not 1<=i<=200: raise ValueError('Device id must be 1..200')
+    # External diagnostics must not block lifecycle mutations.
+    if action=='check_proxy': return check_proxy(i)
     with open('/run/lock/fermde-agent.lock','w') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         if action=='create': return create(i,req)
@@ -355,8 +357,6 @@ def main():
         if action=='delete': return delete(i)
         if action=='logs':
             return {'log':run('journalctl','-u',unit(i,'phone'),'-n','65','--no-pager')}
-        if action=='check_proxy':
-            return check_proxy(i)
         raise ValueError('Unsupported action')
 
 if __name__=='__main__':

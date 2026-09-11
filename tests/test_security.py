@@ -1,5 +1,6 @@
 """Run ONLY on the target server with deploy/check-server.sh."""
 import hashlib
+import asyncio
 import os
 import struct
 import tempfile
@@ -95,5 +96,19 @@ class AccessTests(unittest.TestCase):
             r=self.client.post(f'/api/devices/{self.d}/actions/check-proxy',headers={'origin':ORIGIN})
         self.assertEqual(r.status_code,200)
         self.assertEqual(db.one('SELECT error FROM devices WHERE id=?',(self.d,))['error'],'')
+
+    def test_optional_setup_cannot_prevent_ready_state(self):
+        from fermde.app import perform
+        db.execute("UPDATE devices SET status='starting',proxy='test' WHERE id=?",(self.d,))
+        host=AsyncMock(side_effect=[[],{'free':100000},{'serial':'10.231.1.2:15555'}])
+        android=AsyncMock(side_effect=['1',RuntimeError('Optional setting timed out')])
+        # Close the diagnostic coroutine without executing external operations.
+        with patch('fermde.app.agent',host), patch('fermde.app.adb',android), \
+             patch('fermde.app.connect_device',AsyncMock()), \
+             patch('fermde.app.db.decrypt',return_value='{}'), \
+             patch('fermde.app.launch',side_effect=lambda coro:coro.close()) as background:
+            asyncio.run(perform(self.d,self.a,'start'))
+        self.assertEqual(db.one('SELECT status FROM devices WHERE id=?',(self.d,))['status'],'running')
+        background.assert_called_once()
 
 if __name__=='__main__': unittest.main()
