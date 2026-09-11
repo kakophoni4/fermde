@@ -100,3 +100,26 @@ nvidia-smi --query-gpu=timestamp,memory.total,memory.used,memory.free,utilizatio
 Прислать вывод check-server, журнал проблемного устройства, модель браузера и
 результаты замеров. Не присылать `/etc/fermde/secret.key`, API-ключ, proxy URL с
 паролем, базу данных или архив резервной копии.
+# Viewer and DNS update
+
+Run `bash deploy/update.sh` from `/opt/fermde-src` on the server. The script runs
+the Python checks on the server and updates panel code without stopping phones.
+Then explicitly stop and start the test phone from the panel (Android's Reboot
+button does not recreate its namespace). Existing app data must remain intact.
+
+- Refresh with Ctrl+F5. Check cards, settings, users and the balance display.
+- Open the viewer: it should fill the viewport. Test fit, 125%, 200%, fullscreen,
+  touch coordinates near all four corners, clipboard, file upload and audio.
+- At narrow viewport widths the controls move below the screen.
+- Close the viewer, reopen and confirm the phone stayed running.
+- Run `bash deploy/diagnose-phone.sh 1`: DNS and external IP must both succeed.
+- Open a site in Android Chrome; namespace probing alone does not prove guest
+  connectivity. Compare the browser's external IP with the panel.
+- Stop `fermde-proxy-1` briefly: fresh requests must fail, with no direct fallback.
+  Start it again and recheck IP; the earlier error must clear after success.
+
+DNS listens only on namespace loopback and forwards to Cloudflare DNS over TCP
+through tun2socks. This removes DNS's dependency on SOCKS5 UDP relay support;
+it does not add UDP support to a provider that lacks it. The TUN route and firewall
+remain in force. Interface binding follows the upstream
+[tun2socks configuration](https://github.com/xjasonlyu/tun2socks/wiki/Examples).

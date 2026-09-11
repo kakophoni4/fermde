@@ -122,8 +122,8 @@ async def perform(i, actor, action):
                 try:
                     result=await agent('check_proxy',id=i)
                     db.execute('UPDATE devices SET ip=? WHERE id=?',(result['ip'],i))
-                except Exception:
-                    db.execute('UPDATE devices SET error=? WHERE id=?',('Android работает; проверка IP не прошла. Прямой выход заблокирован.',i))
+                except Exception as e:
+                    db.execute('UPDATE devices SET ip=?,error=? WHERE id=?',('',str(e)[:500],i))
             elif action=='stop':
                 await agent('stop',id=i)
                 db.execute("UPDATE devices SET status='stopped',wanted=0,error='' WHERE id=?",(i,))
@@ -272,8 +272,13 @@ async def device_action(i:int,action:str,request:Request):
             db.audit(u['id'],'change-proxy',i)
         return {'ok':True}
     if action=='check-proxy':
-        result=await agent('check_proxy',id=i)
-        db.execute('UPDATE devices SET ip=? WHERE id=?',(result['ip'],i)); return result
+        if d['status']!='running': fail('Сначала запустите телефон')
+        try:
+            result=await agent('check_proxy',id=i)
+        except RuntimeError as e:
+            db.execute('UPDATE devices SET ip=?,error=? WHERE id=?',('',str(e)[:500],i))
+            fail(str(e),502)
+        db.execute("UPDATE devices SET ip=?,error='' WHERE id=?",(result['ip'],i)); return result
     if d['status'] in ('creating','starting','booting','stopping','deleting'): fail('Дождитесь завершения текущей операции')
     if action=='restart':
         if d['status']!='running': fail('Телефон не запущен')

@@ -79,4 +79,21 @@ class AccessTests(unittest.TestCase):
         r=self.client.post('/api/admin/settings',headers={'origin':ORIGIN},json={'reserve_mib':0})
         self.assertEqual(r.status_code,400)
 
+    def test_proxy_failure_is_json_and_clears_stale_ip(self):
+        self.login('admin','test-password-123')
+        db.execute("UPDATE devices SET status='running',ip='8.8.8.8' WHERE id=?",(self.d,))
+        with patch('fermde.app.agent',new=AsyncMock(side_effect=RuntimeError('DNS timeout'))):
+            r=self.client.post(f'/api/devices/{self.d}/actions/check-proxy',headers={'origin':ORIGIN})
+        self.assertEqual(r.status_code,502)
+        self.assertEqual(r.json()['detail'],'DNS timeout')
+        self.assertEqual(db.one('SELECT ip FROM devices WHERE id=?',(self.d,))['ip'],'')
+
+    def test_proxy_recovery_clears_error(self):
+        self.login('admin','test-password-123')
+        db.execute("UPDATE devices SET status='running',error='DNS timeout' WHERE id=?",(self.d,))
+        with patch('fermde.app.agent',new=AsyncMock(return_value={'ip':'8.8.8.8'})):
+            r=self.client.post(f'/api/devices/{self.d}/actions/check-proxy',headers={'origin':ORIGIN})
+        self.assertEqual(r.status_code,200)
+        self.assertEqual(db.one('SELECT error FROM devices WHERE id=?',(self.d,))['error'],'')
+
 if __name__=='__main__': unittest.main()

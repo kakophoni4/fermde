@@ -88,7 +88,7 @@ def network(i, conn):
     m['endpoint']=addr
     write(base/'manifest.json',json.dumps(m))
     run('ip','netns','add',ns)
-    write(f'/etc/netns/{ns}/resolv.conf','nameserver 1.1.1.1\nnameserver 1.0.0.1\n',0o644)
+    write(f'/etc/netns/{ns}/resolv.conf','nameserver 127.0.0.1\noptions timeout:3 attempts:2\n',0o644)
     run('ip','link','add',hostif,'type','veth','peer','name',peer)
     run('ip','link','set',peer,'netns',ns)
     run('ip','addr','add',host+'/30','dev',hostif)
@@ -125,7 +125,7 @@ def network(i, conn):
     ensure_ipt('filter','FORWARD',['-i',hostif,'-d',addr,'-j','ACCEPT'])
     ensure_ipt('filter','FORWARD',['-o',hostif,'-m','conntrack','--ctstate','ESTABLISHED,RELATED','-j','ACCEPT'])
     proxy = f"socks5://{quote(conn['username'],safe='')}:{quote(conn['password'],safe='')}@{addr}:{port}"
-    write(base/'tunnel.yml','device: tun://tun0\nproxy: '+json.dumps(proxy)+'\nloglevel: error\n')
+    write(base/'tunnel.yml','device: tun://tun0\nproxy: '+json.dumps(proxy)+'\ninterface: '+peer+'\nloglevel: error\n')
     # Namespace deny rules remain if tun2socks dies: no fallback to host Internet.
     write(f'/etc/systemd/system/{unit(i,"proxy")}',f'''[Unit]
 Description=Fermde proxy {i}
@@ -144,13 +144,25 @@ ExecStart=/usr/bin/socat TCP4-LISTEN:15555,bind={guest},reuseaddr,fork TCP4:127.
 Restart=on-failure
 RestartSec=3
 ''',0o644)
+    write(f'/etc/systemd/system/{unit(i,"dns")}',f'''[Unit]
+Description=Fermde DNS over tunnel {i}
+[Service]
+NetworkNamespacePath=/run/netns/{ns}
+ExecStart=/opt/fermde/venv/bin/python /opt/fermde/dns_forwarder.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+''',0o644)
     run('systemctl','daemon-reload')
-    run('systemctl','start',unit(i,'proxy'),unit(i,'adb'))
+    run('systemctl','start',unit(i,'proxy'),unit(i,'dns'),unit(i,'adb'))
     return guest, addr
 
 def cleanup_network(i):
     user, base, ns = names(i)
-    for kind in ('adb','proxy'):
+    for kind in ('adb','dns','proxy'):
         run('systemctl','stop',unit(i,kind),check=False)
     m = json.loads((base/'manifest.json').read_text()) if (base/'manifest.json').exists() else {}
     guest = f'10.231.{i}.2'
@@ -261,7 +273,8 @@ Environment=ANDROID_TMP=/run/fermde-phone-{i}
 Environment=DISPLAY=:99
 Environment=XAUTHORITY={auth}
 NetworkNamespacePath=/run/netns/{ns}
-ExecStart={SDK}/emulator/emulator -avd phone -port 5554 -accel on -gpu host -no-window -no-snapshot -no-metrics -cores 4 -memory 4096 -camera-back none -camera-front none -dns-server 1.1.1.1 -timezone Europe/Samara
+BindReadOnlyPaths=/etc/netns/{ns}/resolv.conf:/etc/resolv.conf
+ExecStart={SDK}/emulator/emulator -avd phone -port 5554 -accel on -gpu host -no-window -no-snapshot -no-metrics -cores 4 -memory 4096 -camera-back none -camera-front none -dns-server 127.0.0.1 -timezone Europe/Samara
 TimeoutStopSec=60
 KillSignal=SIGTERM
 MemoryMax=8G
@@ -292,10 +305,37 @@ def delete(i):
     if base.is_symlink() or base.resolve().parent != ROOT.resolve(): raise ValueError('Invalid directory')
     if base.exists(): shutil.rmtree(base)
     run('userdel',user,check=False)
-    for kind in ('phone','proxy','adb'):
+    for kind in ('phone','proxy','dns','adb'):
         Path('/etc/systemd/system',unit(i,kind)).unlink(missing_ok=True)
     run('systemctl','daemon-reload')
     return {'deleted':True}
+
+def check_proxy(i):
+    if not active(i):
+        raise RuntimeError('Сначала запустите телефон')
+    if run('systemctl','is-active',unit(i,'proxy'),check=False) != 'active':
+        raise RuntimeError('Служба прокси не работает. Перезапустите телефон.')
+    errors = []
+    started = time.monotonic()
+    for url in ('https://api.ipify.org', 'https://checkip.amazonaws.com'):
+        p = subprocess.run(['ip','netns','exec',names(i)[2],'curl','--noproxy','*',
+                            '-4','-fsS','--connect-timeout','12','--max-time','18',url],
+                           capture_output=True,text=True,timeout=22)
+        if p.returncode == 0:
+            try:
+                address = ipaddress.ip_address(p.stdout.strip())
+                if address.version == 4 and address.is_global:
+                    return {'ip':str(address),'checked_at':int(time.time()),
+                            'elapsed_ms':round((time.monotonic()-started)*1000)}
+            except ValueError:
+                pass
+        errors.append((p.returncode,p.stderr.lower()))
+    if any(code == 6 or 'resolving' in error for code,error in errors):
+        raise RuntimeError('DNS не отвечает через прокси. Перезапустите телефон после обновления DNS-службы.')
+    if any(code == 60 for code,_ in errors):
+        raise RuntimeError('Не удалось проверить TLS-сертификат сервиса проверки IP.')
+    raise RuntimeError('HTTPS через прокси не отвечает. Проверьте доступность прокси-сессии.')
+
 
 def main():
     if os.geteuid()!=0: raise PermissionError('Root agent required')
@@ -316,10 +356,7 @@ def main():
         if action=='logs':
             return {'log':run('journalctl','-u',unit(i,'phone'),'-n','65','--no-pager')}
         if action=='check_proxy':
-            # The request passes through the same namespace path as Android.
-            value=run('ip','netns','exec',names(i)[2],'curl','-fsS','--max-time','20',
-                      'https://api.ipify.org',timeout=25)
-            return {'ip':str(ipaddress.ip_address(value))}
+            return check_proxy(i)
         raise ValueError('Unsupported action')
 
 if __name__=='__main__':

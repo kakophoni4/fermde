@@ -3,7 +3,7 @@
 set -euo pipefail
 cd /opt/fermde
 echo '=== Python import and syntax ==='
-venv/bin/python -m compileall -q fermde agent.py
+venv/bin/python -m compileall -q fermde agent.py dns_forwarder.py
 echo '=== Unit tests (server only) ==='
 venv/bin/python -m unittest discover -s tests -v
 echo '=== Services ==='
