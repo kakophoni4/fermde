@@ -183,4 +183,36 @@ class AccessTests(unittest.TestCase):
         host.assert_not_awaited()
         self.assertEqual(db.one('SELECT status FROM devices WHERE id=?',(self.d,))['status'],'stopping')
 
+    def test_file_roundtrip_and_cross_user_isolation(self):
+        self.login('admin','test-password-123')
+        r=self.client.post('/api/files',headers={'origin':ORIGIN},files={'file':('отчёт.txt',b'example bytes')})
+        self.assertEqual(r.status_code,200)
+        key=r.json()['id']
+        self.assertEqual(self.client.get('/api/files/'+key+'/download').content,b'example bytes')
+        self.assertEqual(self.client.get('/api/files').json()['files'][0]['name'],'отчёт.txt')
+        self.login()
+        self.assertEqual(self.client.get('/api/files').json()['files'],[])
+        self.assertEqual(self.client.get('/api/files/'+key+'/download').status_code,404)
+        self.assertEqual(self.client.delete('/api/files/'+key,headers={'origin':ORIGIN}).status_code,404)
+
+    def test_file_name_cannot_escape_storage(self):
+        self.login()
+        r=self.client.post('/api/files',headers={'origin':ORIGIN},files={'file':('../../escape.txt',b'data')})
+        self.assertEqual(r.status_code,200)
+        self.assertEqual(r.json()['name'],'escape.txt')
+        self.assertFalse((db.DATA/'escape.txt').exists())
+
+    def test_phone_file_access_requires_ownership(self):
+        self.login()
+        self.assertEqual(self.client.get(f'/api/devices/{self.d}/files').status_code,404)
+        self.assertEqual(self.client.post(f'/api/devices/{self.d}/files/import',headers={'origin':ORIGIN},json={'name':'a.txt'}).status_code,404)
+
+    def test_phone_import_rejects_path_traversal(self):
+        self.login('admin','test-password-123')
+        db.execute("UPDATE devices SET status='running' WHERE id=?",(self.d,))
+        with patch('fermde.app.adb',AsyncMock()) as command:
+            r=self.client.post(f'/api/devices/{self.d}/files/import',headers={'origin':ORIGIN},json={'name':'../secret'})
+        self.assertEqual(r.status_code,400)
+        command.assert_not_awaited()
+
 if __name__=='__main__': unittest.main()

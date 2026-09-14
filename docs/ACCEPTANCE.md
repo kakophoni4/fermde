@@ -102,6 +102,25 @@ nvidia-smi --query-gpu=timestamp,memory.total,memory.used,memory.free,utilizatio
 паролем, базу данных или архив резервной копии.
 # Viewer and DNS update
 
+## File exchange
+
+Open Files from navigation or the viewer. Upload a file with a Unicode name,
+download it, and compare its bytes. Open the same account in another browser:
+the file must still be listed. A different account must not see or download it,
+even when given its download URL. Download URLs require an active login.
+
+Select a running phone as the destination and send the file. It must appear in
+Android Download. Select that phone's Download folder, retrieve a file and
+confirm it is both saved to the account's server folder and downloaded to the PC.
+Existing APK installation through the viewer's upload control remains separate;
+the file exchange's Send action copies a file without installing it.
+
+Limits: 512 MiB per file, 5 GiB per account. Files are stored under
+`/var/lib/fermde/files/<user-id>` independently of phone lifetimes. Include this
+directory in storage backups; the existing configuration and device backup
+scripts do not archive these account files. Browser downloads are explicit,
+not continuous synchronization with a Windows filesystem directory.
+
 ## Concurrent lifecycle checks
 
 After updating, start two stopped phones without waiting for the first to boot.

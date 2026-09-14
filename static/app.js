@@ -1,3 +1,4 @@
+import './files-ui.js?v=1';
 import {PhoneAudio} from './audio.js';
 let audioEnabled=false, phoneAudio=null, statsUpdatedAt=0;
 const $=s=>document.querySelector(s);

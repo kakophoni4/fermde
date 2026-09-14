@@ -3,6 +3,9 @@ import contextlib
 import hashlib
 import json
 import logging
+import shlex
+import tempfile
+import shutil
 import os
 import re
 import secrets
@@ -14,6 +17,7 @@ from fastapi import FastAPI, Request, HTTPException, WebSocket, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fermde import store as db
+from fermde import files as exchange
 from fermde.profiles import PROFILES
 
 ORIGIN = os.environ.get('FERMDE_ORIGIN','https://localhost').rstrip('/')
@@ -22,11 +26,15 @@ ADB = '/opt/fermde-sdk/platform-tools/adb'
 os.environ['ADB_SERVER_SOCKET']='tcp:127.0.0.1:5039'
 operation_lock = asyncio.Lock()
 device_locks = {}
+file_locks = {}
 jobs = set()
 log = logging.getLogger('uvicorn.error')
 
 def device_lock(i):
     return device_locks.setdefault(i,asyncio.Lock())
+
+def file_lock(uid):
+    return file_locks.setdefault(uid,asyncio.Lock())
 
 def fail(message, code=400): raise HTTPException(code,message)
 
@@ -396,6 +404,103 @@ async def upload(i:int,request:Request,file:UploadFile=File(...)):
             await adb(serial,'push',str(path),'/sdcard/Download/'+name,timeout=180)
         db.audit(u['id'],'upload',i); return {'ok':True}
     finally: path.unlink(missing_ok=True)
+
+
+def transfer_temp():
+    root=db.DATA/'uploads'
+    root.mkdir(exist_ok=True,mode=0o700)
+    fd,name=tempfile.mkstemp(dir=root)
+    os.close(fd)
+    return Path(name)
+
+
+def own_file(uid,key):
+    try: return exchange.entry(uid,key)
+    except FileNotFoundError: fail('Файл не найден',404)
+
+
+@app.get('/api/files')
+async def list_files(request:Request):
+    u=user(request)
+    return {'files':exchange.entries(u['id']),'limit':exchange.MAX_STORAGE}
+
+
+@app.post('/api/files')
+async def save_file(request:Request,file:UploadFile=File(...)):
+    u=user(request)
+    async with file_lock(u['id']):
+        path=transfer_temp()
+        try:
+            size=0
+            with path.open('wb') as dest:
+                while chunk:=await file.read(1024*1024):
+                    size+=len(chunk)
+                    if size>exchange.MAX_FILE: fail('Максимальный размер файла — 512 МБ')
+                    dest.write(chunk)
+            try: return exchange.publish(u['id'],path,file.filename)
+            except ValueError as e: fail(str(e))
+        finally: path.unlink(missing_ok=True)
+
+
+@app.get('/api/files/{key}/download')
+async def download_file(key:str,request:Request):
+    path,meta=own_file(user(request)['id'],key)
+    return FileResponse(path/'data',filename=meta['name'],media_type='application/octet-stream',
+                        headers={'Cache-Control':'private, no-store'})
+
+
+@app.delete('/api/files/{key}')
+async def delete_file(key:str,request:Request):
+    u=user(request)
+    async with file_lock(u['id']):
+        path,_=own_file(u['id'],key)
+        shutil.rmtree(path)
+    return {'ok':True}
+
+
+@app.post('/api/files/{key}/send/{i}')
+async def send_file(key:str,i:int,request:Request):
+    u=user(request);d=device_for(u,i)
+    if d['status']!='running': fail('Сначала запустите телефон')
+    async with file_lock(u['id']):
+        path,meta=own_file(u['id'],key)
+        # ADB push uses the sync protocol, not an interpolated remote shell.
+        await adb(f'10.231.{i}.2:15555','push',str(path/'data'),
+                  '/sdcard/Download/'+meta['name'],timeout=180)
+    return {'ok':True}
+
+
+@app.get('/api/devices/{i}/files')
+async def phone_files(i:int,request:Request):
+    d=device_for(user(request),i)
+    if d['status']!='running': fail('Сначала запустите телефон')
+    result=await adb(f'10.231.{i}.2:15555','shell',
+                     'find /sdcard/Download -maxdepth 1 -type f -print0',timeout=15)
+    return {'files':[p.removeprefix('/sdcard/Download/') for p in result.split('\x00')
+                     if p.startswith('/sdcard/Download/') and '/' not in p.removeprefix('/sdcard/Download/')]}
+
+
+@app.post('/api/devices/{i}/files/import')
+async def import_phone_file(i:int,request:Request):
+    u=user(request);d=device_for(u,i);body=await request.json()
+    if d['status']!='running': fail('Сначала запустите телефон')
+    name=body.get('name')
+    if not isinstance(name,str) or name in ('','.', '..') or '/' in name or '\\' in name or '\x00' in name:
+        fail('Недопустимое имя файла')
+    remote='/sdcard/Download/'+name
+    async with file_lock(u['id']):
+        # Quote the full path because adb shell joins its command arguments.
+        size=await adb(f'10.231.{i}.2:15555','shell','stat -c %s -- '+shlex.quote(remote),timeout=10)
+        if not size.isdigit(): fail('Не удалось определить размер файла')
+        if int(size)>exchange.MAX_FILE: fail('Максимальный размер файла — 512 МБ')
+        if sum(x['size'] for x in exchange.entries(u['id']))+int(size)>exchange.MAX_STORAGE:
+            fail('Папка заполнена: лимит 5 ГБ')
+        path=transfer_temp()
+        try:
+            await adb(f'10.231.{i}.2:15555','pull',remote,str(path),timeout=180)
+            try: return exchange.publish(u['id'],path,name)
+            except ValueError as e: fail(str(e))
+        finally: path.unlink(missing_ok=True)
 
 @app.get('/api/admin/users')
 async def users(request:Request): admin(request); return [safe_user(u) for u in db.rows('SELECT * FROM users')]
