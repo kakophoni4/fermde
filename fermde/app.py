@@ -545,7 +545,7 @@ async def save_settings(request:Request):
         if not 8<=len(key)<=500: fail('Некорректный API-ключ')
         db.set_setting('floppy_key',db.encrypt(key))
     db.set_setting('country',country)
-    for key,low,high in [('max_running',1,4),('reserve_mib',8192,14000),('headroom_mib',1024,4096),('device_budget_mib',1536,4096)]:
+    for key,low,high in [('max_running',1,4),('reserve_mib',0,14000),('headroom_mib',0,4096),('device_budget_mib',1536,4096)]:
         if key in b:
             value=int(b[key])
             if not low<=value<=high: fail(f'{key}: диапазон {low}–{high}')

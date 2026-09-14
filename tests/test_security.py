@@ -78,9 +78,9 @@ class AccessTests(unittest.TestCase):
         with self.assertRaises(ValueError): control_packet({'type':'shell','text':'id'},720,1600)
         with self.assertRaises(ValueError): control_packet({'type':'key','key':999999},720,1600)
 
-    def test_reserve_cannot_be_lowered(self):
+    def test_reserve_cannot_be_negative(self):
         self.login('admin','test-password-123')
-        r=self.client.post('/api/admin/settings',headers={'origin':ORIGIN},json={'reserve_mib':0})
+        r=self.client.post('/api/admin/settings',headers={'origin':ORIGIN},json={'reserve_mib':-1})
         self.assertEqual(r.status_code,400)
 
     def test_proxy_failure_is_json_and_clears_stale_ip(self):
